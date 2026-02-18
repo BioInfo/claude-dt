@@ -249,6 +249,74 @@ def report(period, project, fmt):
             console.print(f"    [dim]Suggestion: {ap['suggestion']}[/dim]")
             console.print()
 
+    # Top recommendations
+    recs = data.get("recommendations", [])
+    if recs:
+        console.print()
+        _print_recommendations(recs[:5], title=f"Top Recommendations")
+
+
+def _print_recommendations(recs: list[dict], title: str = "Recommendations"):
+    """Print recommendations with Rich formatting."""
+    if not recs:
+        console.print("[green]No recommendations. Looking good.[/green]")
+        return
+
+    high = sum(1 for r in recs if r["priority"] == "high")
+    med = sum(1 for r in recs if r["priority"] == "medium")
+    low = sum(1 for r in recs if r["priority"] == "low")
+    console.print(Panel.fit(
+        f"[bold]{title}[/bold]: {len(recs)} total "
+        f"([red]{high} high[/red], [yellow]{med} medium[/yellow], [blue]{low} low[/blue])",
+        border_style="magenta"
+    ))
+
+    for rec in recs:
+        priority_style = {"high": "red bold", "medium": "yellow", "low": "blue"}.get(rec["priority"], "")
+        cat_style = "dim"
+
+        console.print(
+            f"  [{priority_style}]{rec['priority'].upper()}[/{priority_style}]  "
+            f"{rec['title']}  [{cat_style}][{rec['category']}][/{cat_style}]"
+        )
+        console.print(f"    {rec['description']}")
+        if rec.get("impact"):
+            console.print(f"    [green]Impact: {rec['impact']}[/green]")
+        console.print(f"    [dim]Prompt:[/dim]")
+        console.print(f"    [dim italic]{rec['prompt']}[/dim italic]")
+        console.print()
+
+
+@cli.command()
+@click.option("--days", type=int, default=7, help="Number of days to analyze")
+@click.option("--format", "fmt", type=click.Choice(["text", "json", "markdown"]), default="text")
+@click.option("--category", type=click.Choice(["all", "context", "session", "model", "prompt", "tools"]), default="all")
+def recommend(days, fmt, category):
+    """Generate prioritized recommendations with ready-to-paste prompts."""
+    from .analyzers import recommend as run_recommend
+    import json
+
+    recs = run_recommend(days, category=category)
+
+    if fmt == "json":
+        console.print(json.dumps(recs, indent=2))
+        return
+
+    if fmt == "markdown":
+        lines = [f"# dt Recommendations - Last {days} Days\n"]
+        for rec in recs:
+            priority_icon = {"high": "!!!", "medium": "!!", "low": "!"}.get(rec["priority"], "")
+            lines.append(f"## {priority_icon} {rec['title']} [{rec['category']}]\n")
+            lines.append(f"{rec['description']}\n")
+            lines.append(f"**Action:** {rec['action']}\n")
+            lines.append(f"**Prompt to fix:**\n```\n{rec['prompt']}\n```\n")
+            if rec.get("impact"):
+                lines.append(f"*Impact: {rec['impact']}*\n")
+        console.print("\n".join(lines))
+        return
+
+    _print_recommendations(recs, title=f"Recommendations (last {days} days)")
+
 
 @cli.command()
 @click.option("--days", type=int, default=7, help="Number of days to analyze")
@@ -694,6 +762,77 @@ def export_cmd(table_name, fmt, output_path, days):
         console.print(f"[red]Export error: {e}[/red]")
     finally:
         conn.close()
+
+
+@cli.command("recommend")
+@click.option("--days", type=int, default=7, help="Analysis period (default: 7)")
+@click.option("--format", "fmt", type=click.Choice(["text", "json", "markdown"]), default="text")
+@click.option("--category", type=click.Choice(["all", "context", "session", "model", "prompt"]), default="all")
+def recommend_cmd(days, fmt, category):
+    """Get prioritized, actionable recommendations."""
+    from .analyzers import recommend, generate_markdown_recommendations
+    import json
+
+    if fmt == "markdown":
+        print(generate_markdown_recommendations(days))
+        return
+
+    data = recommend(days)
+    recs = data["recommendations"]
+
+    if category != "all":
+        recs = [r for r in recs if r["category"] == category]
+
+    if fmt == "json":
+        print(json.dumps({"recommendations": recs, "summary": data["summary"]}, indent=2))
+        return
+
+    if not recs:
+        console.print("[green]No recommendations for this period. Nice work![/green]")
+        return
+
+    # Summary panel
+    s = data["summary"]
+    bp = s["by_priority"]
+    scores = s.get("scores", {})
+    summary_text = Text()
+    summary_text.append(f"  Overall Score: ", style="bold")
+    c = scores.get("composite", 0)
+    summary_text.append(f"{c}/100", style="green bold" if c >= 80 else ("yellow bold" if c >= 60 else "red bold"))
+    summary_text.append(f"\n  Recommendations: {s['total']}")
+    summary_text.append(f" ({bp.get('high', 0)} high", style="red")
+    summary_text.append(f", {bp.get('medium', 0)} medium", style="yellow")
+    summary_text.append(f", {bp.get('low', 0)} low)", style="dim")
+    console.print(Panel(summary_text, title=f"Recommendations - Last {days} Days", border_style="blue"))
+
+    # Group by category
+    categories = {"context": "Context Optimization", "session": "Session Hygiene",
+                   "model": "Model Routing", "prompt": "Prompt Improvement"}
+
+    for cat_key, cat_label in categories.items():
+        cat_recs = [r for r in recs if r["category"] == cat_key]
+        if not cat_recs:
+            continue
+
+        console.print()
+        t = Table(title=cat_label, border_style="blue", show_lines=True)
+        t.add_column("Priority", width=6)
+        t.add_column("Issue", max_width=50)
+        t.add_column("Action", max_width=40)
+        t.add_column("Impact", max_width=25)
+
+        for r in cat_recs:
+            p = r["priority"]
+            style = {"high": "red bold", "medium": "yellow", "low": "dim"}.get(p, "")
+            t.add_row(
+                f"[{style}]{p.upper()}[/{style}]",
+                f"[bold]{r['title']}[/bold]\n{r['description']}",
+                r["action"],
+                r["estimated_impact"],
+            )
+        console.print(t)
+
+    console.print()
 
 
 if __name__ == "__main__":
