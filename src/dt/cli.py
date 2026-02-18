@@ -76,11 +76,16 @@ def status():
 @cli.command()
 @click.option("--period", type=int, default=7, help="Number of days to analyze (default: 7)")
 @click.option("--project", type=str, help="Filter to specific project")
-@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--format", "fmt", type=click.Choice(["text", "json", "markdown"]), default="text")
 def report(period, project, fmt):
     """Generate a comprehensive report."""
-    from .analyzers import generate_report
+    from .analyzers import generate_report, generate_markdown_report
     import json
+
+    if fmt == "markdown":
+        md = generate_markdown_report(days=period)
+        console.print(md)
+        return
 
     data = generate_report(days=period)
 
@@ -453,14 +458,141 @@ def query(sql):
         conn.close()
 
 
+def _generate_claudemd_suggestions(health_data: dict, project_filter: str | None = None):
+    """Generate CLAUDE.md content suggestions based on usage patterns."""
+    candidates = health_data.get("claudemd_candidates", [])
+    fragmenters = health_data.get("context_fragmenters", [])
+
+    if not candidates and not fragmenters:
+        console.print("[green]No CLAUDE.md improvements detected.[/green]")
+        return
+
+    console.print("# Suggested CLAUDE.md additions\n")
+    console.print("# Based on file access patterns from dt health analysis\n")
+
+    if candidates:
+        console.print("## Frequently Re-read Files\n")
+        console.print("# These files are read repeatedly across sessions.")
+        console.print("# Consider adding key content from these files to your CLAUDE.md:\n")
+        for row in candidates[:10]:
+            fp = str(row[0])
+            console.print(f"# {fp}")
+            console.print(f"#   {row[1]} sessions, {row[3]} reads/session")
+            # Suggest based on file type
+            if fp.endswith((".tsx", ".ts", ".jsx", ".js")):
+                console.print(f"#   Suggestion: Document component API, key patterns, or imports")
+            elif fp.endswith(".py"):
+                console.print(f"#   Suggestion: Document module purpose, key functions, or config")
+            elif fp.endswith(".md"):
+                console.print(f"#   Suggestion: Inline key content or link in CLAUDE.md")
+            console.print()
+
+    if fragmenters:
+        console.print("## Context Fragmenters\n")
+        console.print("# These files cause repeated reads within single sessions.")
+        console.print("# Consider splitting large files or adding summaries:\n")
+        for row in fragmenters[:10]:
+            fp = str(row[0])
+            console.print(f"# {fp}")
+            console.print(f"#   {row[1]} total reads, {row[2]} repeat reads across {row[3]} sessions")
+            console.print()
+
+
+@cli.command()
+@click.option("--days", type=int, default=14, help="Total period to compare (split in half)")
+def trends(days):
+    """Show usage trends with period comparison."""
+    from .analyzers import analyze_trends, _sparkline
+
+    data = analyze_trends(days)
+    half = data["period_days"]
+    cur = data["current"]
+    prev = data["previous"]
+
+    def _delta(cur_val, prev_val):
+        if not prev_val:
+            return "[dim]new[/dim]"
+        pct = (cur_val - prev_val) / prev_val * 100
+        if pct > 0:
+            return f"[green]+{pct:.0f}%[/green]"
+        elif pct < 0:
+            return f"[red]{pct:.0f}%[/red]"
+        return "[dim]0%[/dim]"
+
+    t = Table(title=f"Trends: Last {half}d vs Previous {half}d", border_style="blue")
+    t.add_column("Metric")
+    t.add_column(f"Current ({half}d)", justify="right")
+    t.add_column(f"Previous ({half}d)", justify="right")
+    t.add_column("Change", justify="right")
+
+    metrics = [
+        ("Sessions", 0), ("Messages", 1), ("Tool calls", 2),
+        ("Tool errors", 3), ("Tokens", 4), ("Avg turns", 5),
+        ("Projects", 6), ("Subagents", 7),
+    ]
+    for label, idx in metrics:
+        c, p = cur[idx] or 0, prev[idx] or 0
+        if label == "Avg turns":
+            t.add_row(label, f"{c:.1f}", f"{p:.1f}", _delta(c, p))
+        else:
+            t.add_row(label, f"{c:,}", f"{p:,}", _delta(c, p))
+
+    console.print(t)
+
+    # Sparklines
+    daily = data.get("daily", [])
+    if daily:
+        console.print()
+        sessions_vals = [r[1] for r in daily]
+        msgs_vals = [r[2] or 0 for r in daily]
+        tools_vals = [r[3] or 0 for r in daily]
+
+        spark_text = Text()
+        spark_text.append("  Sessions: ", style="bold")
+        spark_text.append(_sparkline(sessions_vals))
+        spark_text.append(f"  ({min(sessions_vals)}-{max(sessions_vals)})\n")
+        spark_text.append("  Messages: ", style="bold")
+        spark_text.append(_sparkline(msgs_vals))
+        spark_text.append(f"  ({min(msgs_vals):,}-{max(msgs_vals):,})\n")
+        spark_text.append("  Tools:    ", style="bold")
+        spark_text.append(_sparkline(tools_vals))
+        spark_text.append(f"  ({min(tools_vals):,}-{max(tools_vals):,})")
+        console.print(Panel(spark_text, title="Daily Activity", border_style="dim"))
+
+    # Model shift
+    cur_models = data.get("current_models", [])
+    prev_models = data.get("previous_models", [])
+    if cur_models or prev_models:
+        from .analyzers import _short_model
+        cur_dict = {_short_model(r[0]): r[1] for r in cur_models}
+        prev_dict = {_short_model(r[0]): r[1] for r in prev_models}
+        all_models = set(cur_dict) | set(prev_dict)
+
+        mt = Table(title="Model Shift", border_style="dim")
+        mt.add_column("Model")
+        mt.add_column("Current", justify="right")
+        mt.add_column("Previous", justify="right")
+        mt.add_column("Change", justify="right")
+        for m in sorted(all_models, key=lambda x: cur_dict.get(x, 0), reverse=True):
+            c, p = cur_dict.get(m, 0), prev_dict.get(m, 0)
+            mt.add_row(m, f"{c:,}", f"{p:,}", _delta(c, p))
+        console.print(mt)
+
+
 @cli.command()
 @click.option("--days", type=int, default=30, help="Number of days to analyze")
-def health(days):
+@click.option("--fix", is_flag=True, help="Generate CLAUDE.md suggestions based on usage patterns")
+@click.option("--project", type=str, help="Filter to specific project")
+def health(days, fix, project):
     """Project configuration health check."""
     from .analyzers import analyze_health, compute_scores
 
     data = analyze_health(days)
     scores = compute_scores(days)
+
+    if fix:
+        _generate_claudemd_suggestions(data, project)
+        return
 
     # Overall health score
     h = scores.get("health", 0)
