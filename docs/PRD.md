@@ -73,7 +73,7 @@ Additional sources:
 -- Core tables
 CREATE TABLE sessions (
     session_id VARCHAR PRIMARY KEY,
-    project VARCHAR NOT NULL,           -- e.g. "-Users-bioinfo-apps-dt"
+    project VARCHAR NOT NULL,           -- e.g. "-Users-username-apps-myproject"
     started_at TIMESTAMP,
     ended_at TIMESTAMP,
     duration_ms BIGINT,

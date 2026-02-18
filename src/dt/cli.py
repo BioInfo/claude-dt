@@ -130,6 +130,20 @@ def report(period, project, fmt):
             mt.add_row(model_short, f"{row[1]:,}", f"{row[2] or 0:,}", f"{row[3] or 0:,}")
         console.print(mt)
 
+    # Subagent model usage
+    if data.get("subagent_model_usage"):
+        smt = Table(title="Subagent Model Usage", border_style="cyan")
+        smt.add_column("Model")
+        smt.add_column("Launches", justify="right")
+        smt.add_column("Messages", justify="right")
+        smt.add_column("Tokens", justify="right")
+        smt.add_column("Tools", justify="right")
+        smt.add_column("Avg Msgs", justify="right")
+        for row in data["subagent_model_usage"]:
+            model_short = row[0].replace("claude-", "").replace("-20251001", "").replace("-20250929", "").replace("-20251101", "")
+            smt.add_row(model_short, f"{row[1]:,}", f"{row[2] or 0:,}", f"{row[3] or 0:,}", f"{row[4] or 0:,}", f"{row[5] or 0:.0f}")
+        console.print(smt)
+
     # Top projects
     if data["top_projects"]:
         pt = Table(title="Top Projects", border_style="dim")

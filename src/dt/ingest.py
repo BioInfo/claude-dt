@@ -9,16 +9,19 @@ from .db import get_connection, init_db
 
 
 def parse_project_name(project_path: str) -> str:
-    """Extract human-readable project name from encoded path."""
+    """Extract human-readable project name from encoded path.
+
+    Claude Code encodes project paths as: -Users-username-apps-myproject
+    This extracts the last meaningful component as the project name.
+    """
     parts = project_path.strip("-").split("-")
-    if len(parts) >= 2 and parts[0] in ("Users", "home") and parts[1] == "bioinfo":
-        remaining = parts[2:]
+    # Skip platform prefix (Users/home) and username
+    if len(parts) >= 2 and parts[0] in ("Users", "home"):
+        remaining = parts[2:]  # Skip prefix + username
         if not remaining:
             return "~"
-        if remaining[0] == "apps" and len(remaining) > 1:
-            return remaining[-1]
         return remaining[-1]
-    return project_path
+    return parts[-1] if parts else project_path
 
 
 def extract_text_content(content) -> str:
@@ -270,7 +273,7 @@ def ingest_session_file(conn, jsonl_path: Path, project_path: str):
 
                 # Batch insert every 5000 messages to avoid memory pressure
                 if len(messages_batch) >= 5000:
-                    _flush_batch(conn, messages_batch, tool_calls_batch)
+                    _flush_batch(conn, messages_batch, tool_calls_batch, tool_results_map)
                     messages_batch.clear()
                     tool_calls_batch.clear()
 
@@ -281,10 +284,10 @@ def ingest_session_file(conn, jsonl_path: Path, project_path: str):
         return None
 
     # Flush remaining
-    _flush_batch(conn, messages_batch, tool_calls_batch)
+    _flush_batch(conn, messages_batch, tool_calls_batch, tool_results_map)
 
-    for tid in tool_results_map:
-        r = tool_results_map[tid]
+    # Count errors from tool results
+    for r in tool_results_map.values():
         if r.get("result_error"):
             tool_errors += 1
 
@@ -422,7 +425,7 @@ def _ingest_large_session(conn, jsonl_path: Path, session_id: str,
     }
 
 
-def _flush_batch(conn, messages_batch, tool_calls_batch):
+def _flush_batch(conn, messages_batch, tool_calls_batch, tool_results_map=None):
     """Insert batched data into DuckDB."""
     if messages_batch:
         conn.executemany("""
@@ -431,12 +434,19 @@ def _flush_batch(conn, messages_batch, tool_calls_batch):
             )
         """, messages_batch)
     if tool_calls_batch:
+        # Apply error info from tool_results_map before inserting
+        resolved = []
+        for tc in tool_calls_batch:
+            tid = tc[0]  # tool_use_id
+            r = (tool_results_map or {}).get(tid, {})
+            resolved.append(tc + (r.get("result_error", False), r.get("result_length", 0)))
         conn.executemany("""
             INSERT OR IGNORE INTO tool_calls (
                 tool_use_id, session_id, message_uuid, agent_id,
-                tool_name, input_summary, timestamp, file_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, tool_calls_batch)
+                tool_name, input_summary, timestamp, file_path,
+                result_error, result_length
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, resolved)
 
 
 def ingest_subagent_files(conn, session_dir: Path, session_id: str):
@@ -676,6 +686,9 @@ def run_ingest(since_days: int | None = None, project_filter: str | None = None,
         print("Importing prompt history...", flush=True)
         ingest_prompts(conn)
 
+        print("Backfilling subagent types...", flush=True)
+        backfill_subagent_types(conn)
+
         print("Computing file access patterns...", flush=True)
         compute_file_access(conn)
 
@@ -696,6 +709,60 @@ def run_ingest(since_days: int | None = None, project_filter: str | None = None,
         }
     finally:
         conn.close()
+
+
+def backfill_subagent_types(conn):
+    """Backfill agent_type from Task tool call input_summaries.
+
+    Task tool calls have input_summary like 'Explore:Find files in codebase'.
+    We match subagents to Task calls by session_id and closest timestamp.
+    """
+    # Get all Task tool calls with their subagent_type
+    task_calls = conn.execute("""
+        SELECT session_id, timestamp, input_summary
+        FROM tool_calls
+        WHERE tool_name = 'Task' AND input_summary IS NOT NULL
+        ORDER BY session_id, timestamp
+    """).fetchall()
+
+    if not task_calls:
+        return
+
+    # Build lookup: session_id -> [(timestamp, agent_type)]
+    session_tasks = {}
+    for session_id, ts, summary in task_calls:
+        agent_type = summary.split(":")[0] if ":" in summary else None
+        if agent_type and ts:
+            session_tasks.setdefault(session_id, []).append((ts, agent_type))
+
+    # Get all subagents without agent_type
+    subagents = conn.execute("""
+        SELECT agent_id, session_id, started_at
+        FROM subagents
+        WHERE agent_type IS NULL AND started_at IS NOT NULL
+    """).fetchall()
+
+    updated = 0
+    for agent_id, session_id, started_at in subagents:
+        tasks = session_tasks.get(session_id, [])
+        if not tasks:
+            continue
+        # Find closest Task call by timestamp (within 5 seconds)
+        best_type = None
+        best_diff = 5.0  # max 5 second window
+        for ts, atype in tasks:
+            diff = abs((started_at - ts).total_seconds())
+            if diff < best_diff:
+                best_diff = diff
+                best_type = atype
+        if best_type:
+            conn.execute(
+                "UPDATE subagents SET agent_type = ? WHERE agent_id = ?",
+                [best_type, agent_id]
+            )
+            updated += 1
+
+    print(f"  Updated {updated}/{len(subagents)} subagent types", flush=True)
 
 
 def compute_file_access(conn):

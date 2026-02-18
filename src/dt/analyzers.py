@@ -323,6 +323,23 @@ def generate_report(days: int = 7) -> dict:
         ORDER BY tokens DESC
     """).fetchall()
 
+    # Subagent model usage (separate from main conversation)
+    subagent_model_usage = conn.execute(f"""
+        SELECT
+            model,
+            COUNT(*) as launches,
+            SUM(message_count) as total_messages,
+            SUM(total_tokens) as total_tokens,
+            SUM(tool_call_count) as total_tools,
+            AVG(message_count) as avg_msgs,
+            AVG(duration_seconds) as avg_duration
+        FROM subagents
+        WHERE started_at >= CURRENT_DATE - {iv}
+          AND model IS NOT NULL AND model != ''
+        GROUP BY model
+        ORDER BY total_tokens DESC
+    """).fetchall()
+
     top_projects = conn.execute(f"""
         SELECT
             project_name,
@@ -349,6 +366,7 @@ def generate_report(days: int = 7) -> dict:
         "period_days": days,
         "overview": overview,
         "model_usage": model_usage,
+        "subagent_model_usage": subagent_model_usage,
         "top_projects": top_projects,
         "daily_trend": daily,
         "context": analyze_context(days),
