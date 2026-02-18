@@ -388,7 +388,7 @@ class TestShortModel:
     def test_short_model_removes_claude_prefix(self):
         """Remove 'claude-' prefix."""
         assert _short_model("claude-opus-4-6") == "opus-4-6"
-        assert _short_model("claude-sonnet-4-20250514") == "sonnet-4-20250514"
+        assert _short_model("claude-sonnet-4-20250514") == "sonnet-4"
 
     def test_short_model_removes_date_suffixes(self):
         """Remove date suffixes from model names."""

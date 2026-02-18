@@ -1,16 +1,16 @@
 """CLI for dt - Claude Code DevTools."""
 import click
 from rich.console import Console
+from . import __version__
 from rich.table import Table
 from rich.panel import Panel
-from rich.columns import Columns
 from rich.text import Text
 
 console = Console()
 
 
 @click.group()
-@click.version_option(version="0.3.0")
+@click.version_option(version=__version__)
 def cli():
     """dt - Claude Code DevTools. Actionable intelligence from session data."""
     pass
@@ -79,25 +79,23 @@ def status():
 @click.option("--format", "fmt", type=click.Choice(["text", "json", "markdown"]), default="text")
 def report(period, project, fmt):
     """Generate a comprehensive report."""
-    from .analyzers import generate_report, generate_markdown_report
+    from .analyzers import generate_report, generate_markdown_report, _short_model
     import json
 
     if fmt == "markdown":
-        md = generate_markdown_report(days=period)
-        console.print(md)
+        print(generate_markdown_report(days=period))
         return
 
     data = generate_report(days=period)
 
     if fmt == "json":
-        # Convert tuples to serializable format
         def serialize(obj):
             if isinstance(obj, tuple):
                 return list(obj)
             if hasattr(obj, 'isoformat'):
                 return obj.isoformat()
             return str(obj)
-        console.print(json.dumps(data, default=serialize, indent=2))
+        print(json.dumps(data, default=serialize, indent=2))
         return
 
     # Scores panel
@@ -147,7 +145,7 @@ def report(period, project, fmt):
         mt.add_column("Tokens", justify="right")
         mt.add_column("Cache Reads", justify="right")
         for row in data["model_usage"]:
-            model_short = row[0].replace("claude-", "").replace("-20251001", "").replace("-20250929", "").replace("-20251101", "")
+            model_short = _short_model(row[0])
             mt.add_row(model_short, f"{row[1]:,}", f"{row[2] or 0:,}", f"{row[3] or 0:,}")
         console.print(mt)
 
@@ -161,7 +159,7 @@ def report(period, project, fmt):
         smt.add_column("Tools", justify="right")
         smt.add_column("Avg Msgs", justify="right")
         for row in data["subagent_model_usage"]:
-            model_short = row[0].replace("claude-", "").replace("-20251001", "").replace("-20250929", "").replace("-20251101", "")
+            model_short = _short_model(row[0])
             smt.add_row(model_short, f"{row[1]:,}", f"{row[2] or 0:,}", f"{row[3] or 0:,}", f"{row[4] or 0:,}", f"{row[5] or 0:.0f}")
         console.print(smt)
 
@@ -195,7 +193,7 @@ def report(period, project, fmt):
         ct.add_column("Direct Input", justify="right")
         ct.add_column("Efficiency", justify="right")
         for row in ctx["cache_efficiency"]:
-            model_short = row[0].replace("claude-", "").replace("-20251001", "").replace("-20250929", "").replace("-20251101", "")
+            model_short = _short_model(row[0])
             style = "green" if (row[4] or 0) > 90 else ("yellow" if (row[4] or 0) > 70 else "red")
             ct.add_row(model_short, f"{row[1] or 0:,}", f"{row[2] or 0:,}", f"[{style}]{row[4] or 0}%[/{style}]")
         console.print(ct)
@@ -222,7 +220,7 @@ def report(period, project, fmt):
         st.add_column("Avg Msgs", justify="right")
         st.add_column("Total Tokens", justify="right")
         for row in tools["subagent_stats"]:
-            model_short = (row[1] or "?").replace("claude-", "").replace("-20251001", "").replace("-20250929", "").replace("-20251101", "")
+            model_short = _short_model(row[1] or "?")
             st.add_row(row[0] or "?", model_short, f"{row[2]:,}", f"{row[3] or 0:.0f}", f"{row[5] or 0:,}")
         console.print(st)
 
@@ -299,7 +297,7 @@ def recommend(days, fmt, category):
     recs = run_recommend(days, category=category)
 
     if fmt == "json":
-        console.print(json.dumps(recs, indent=2))
+        print(json.dumps(recs, indent=2))
         return
 
     if fmt == "markdown":
@@ -312,7 +310,7 @@ def recommend(days, fmt, category):
             lines.append(f"**Prompt to fix:**\n```\n{rec['prompt']}\n```\n")
             if rec.get("impact"):
                 lines.append(f"*Impact: {rec['impact']}*\n")
-        console.print("\n".join(lines))
+        print("\n".join(lines))
         return
 
     _print_recommendations(recs, title=f"Recommendations (last {days} days)")

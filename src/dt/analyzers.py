@@ -546,15 +546,16 @@ def generate_report(days: int = 7) -> dict:
 
     overview = conn.execute(f"""
         SELECT
-            COUNT(DISTINCT session_id),
-            SUM(message_count),
-            SUM(tool_call_count),
-            SUM(tool_error_count),
-            SUM(total_input_tokens + total_output_tokens),
-            SUM(total_cache_read),
-            AVG(message_count),
-            COUNT(DISTINCT project_name)
-        FROM sessions WHERE first_message_at >= CURRENT_DATE - {iv}
+            COUNT(*) as sessions,
+            COALESCE(SUM(message_count), 0) as messages,
+            COALESCE(SUM(tool_call_count), 0) as tool_calls,
+            COALESCE(SUM(tool_error_count), 0) as tool_errors,
+            COALESCE(SUM(total_input_tokens + total_output_tokens), 0) as tokens,
+            COALESCE(SUM(total_cache_read), 0) as cache_reads,
+            COALESCE(AVG(user_message_count), 0) as avg_turns,
+            COUNT(DISTINCT project_name) as projects
+        FROM sessions
+        WHERE first_message_at >= CURRENT_DATE - {iv}
     """).fetchone()
 
     top_projects = conn.execute(f"""
@@ -576,10 +577,20 @@ def generate_report(days: int = 7) -> dict:
         GROUP BY model ORDER BY launches DESC
     """).fetchall()
 
-    conn.close()
+    model_usage = conn.execute(f"""
+        SELECT
+            model,
+            COUNT(*) as messages,
+            SUM(input_tokens + output_tokens) as tokens,
+            SUM(cache_read_tokens) as cache_reads
+        FROM messages
+        WHERE timestamp >= CURRENT_DATE - {iv}
+          AND model IS NOT NULL AND model != ''
+        GROUP BY model
+        ORDER BY messages DESC
+    """).fetchall()
 
-    tools_data = analyze_tools(days)
-    model_usage = tools_data.get("model_usage", [])
+    conn.close()
 
     return {
         "period_days": days,
@@ -588,7 +599,7 @@ def generate_report(days: int = 7) -> dict:
         "top_projects": top_projects,
         "subagent_model_usage": subagent_model_usage,
         "context": analyze_context(days),
-        "tools": tools_data,
+        "tools": analyze_tools(days),
         "prompts": analyze_prompts(days),
         "antipatterns": detect_antipatterns(days),
         "scores": compute_scores(days),
@@ -836,7 +847,9 @@ def _sparkline(values: list[int | float], width: int = 20) -> str:
 
 def _short_model(model: str) -> str:
     """Shorten model name for display."""
-    return model.replace("claude-", "").replace("-20251001", "").replace("-20250929", "").replace("-20251101", "")
+    import re
+    name = model.replace("claude-", "")
+    return re.sub(r"-\d{8}$", "", name)
 
 
 def _short_path(path: str) -> str:

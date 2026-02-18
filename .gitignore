@@ -8,3 +8,7 @@ build/
 *.duckdb
 *.duckdb.wal
 .DS_Store
+.pytest_cache/
+dt-*.csv
+dt-*.json
+dt-*.parquet
