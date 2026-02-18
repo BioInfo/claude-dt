@@ -539,6 +539,64 @@ def compute_scores(days: int = 7) -> dict:
     }
 
 
+def generate_report(days: int = 7) -> dict:
+    """Generate a comprehensive report dict aggregating all analyzers."""
+    conn = get_connection(read_only=True)
+    iv = _interval(days)
+
+    overview = conn.execute(f"""
+        SELECT
+            COUNT(DISTINCT session_id),
+            SUM(message_count),
+            SUM(tool_call_count),
+            SUM(tool_error_count),
+            SUM(total_input_tokens + total_output_tokens),
+            SUM(total_cache_read),
+            AVG(message_count),
+            COUNT(DISTINCT project_name)
+        FROM sessions WHERE first_message_at >= CURRENT_DATE - {iv}
+    """).fetchone()
+
+    top_projects = conn.execute(f"""
+        SELECT project_name, COUNT(*) as sessions,
+            SUM(message_count) as msgs, SUM(tool_call_count) as tools
+        FROM sessions WHERE first_message_at >= CURRENT_DATE - {iv}
+            AND project_name IS NOT NULL
+        GROUP BY project_name ORDER BY sessions DESC LIMIT 10
+    """).fetchall()
+
+    subagent_model_usage = conn.execute(f"""
+        SELECT model, COUNT(*) as launches,
+            SUM(message_count) as msgs, SUM(total_tokens) as tokens,
+            SUM(tool_call_count) as tools, AVG(message_count) as avg_msgs
+        FROM subagents WHERE session_id IN (
+            SELECT session_id FROM sessions
+            WHERE first_message_at >= CURRENT_DATE - {iv}
+        ) AND model IS NOT NULL
+        GROUP BY model ORDER BY launches DESC
+    """).fetchall()
+
+    conn.close()
+
+    tools_data = analyze_tools(days)
+    model_usage = tools_data.get("model_usage", [])
+
+    return {
+        "period_days": days,
+        "overview": overview,
+        "model_usage": model_usage,
+        "top_projects": top_projects,
+        "subagent_model_usage": subagent_model_usage,
+        "context": analyze_context(days),
+        "tools": tools_data,
+        "prompts": analyze_prompts(days),
+        "antipatterns": detect_antipatterns(days),
+        "scores": compute_scores(days),
+        "health": analyze_health(days),
+        "recommendations": recommend(days),
+    }
+
+
 def generate_markdown_report(days: int = 7, title: str | None = None) -> str:
     """Generate a complete markdown report."""
     data = generate_report(days)
@@ -1167,340 +1225,3 @@ def _rec_tool_errors(conn, iv: str) -> list[dict]:
         })
 
     return recs
-
-
-def generate_report(days: int = 7) -> dict:
-    """Generate a comprehensive report combining all analyzers."""
-    conn = get_connection(read_only=True)
-    iv = _interval(days)
-
-    overview = conn.execute(f"""
-        SELECT
-            COUNT(*) as sessions,
-            SUM(message_count) as messages,
-            SUM(tool_call_count) as tool_calls,
-            SUM(tool_error_count) as tool_errors,
-            SUM(total_input_tokens + total_output_tokens) as total_tokens,
-            SUM(total_cache_read) as cache_reads,
-            AVG(user_message_count) as avg_turns,
-            COUNT(DISTINCT project_name) as projects
-        FROM sessions
-        WHERE first_message_at >= CURRENT_DATE - {iv}
-    """).fetchone()
-
-    model_usage = conn.execute(f"""
-        SELECT
-            model,
-            COUNT(*) as messages,
-            SUM(input_tokens + output_tokens) as tokens,
-            SUM(cache_read_tokens) as cache_reads
-        FROM messages
-        WHERE timestamp >= CURRENT_DATE - {iv}
-          AND model IS NOT NULL AND model != ''
-        GROUP BY model
-        ORDER BY tokens DESC
-    """).fetchall()
-
-    # Subagent model usage (separate from main conversation)
-    subagent_model_usage = conn.execute(f"""
-        SELECT
-            model,
-            COUNT(*) as launches,
-            SUM(message_count) as total_messages,
-            SUM(total_tokens) as total_tokens,
-            SUM(tool_call_count) as total_tools,
-            AVG(message_count) as avg_msgs,
-            AVG(duration_seconds) as avg_duration
-        FROM subagents
-        WHERE started_at >= CURRENT_DATE - {iv}
-          AND model IS NOT NULL AND model != ''
-        GROUP BY model
-        ORDER BY total_tokens DESC
-    """).fetchall()
-
-    top_projects = conn.execute(f"""
-        SELECT
-            project_name,
-            COUNT(*) as sessions,
-            SUM(message_count) as messages,
-            SUM(tool_call_count) as tool_calls
-        FROM sessions
-        WHERE first_message_at >= CURRENT_DATE - {iv}
-        GROUP BY project_name
-        ORDER BY messages DESC
-        LIMIT 10
-    """).fetchall()
-
-    daily = conn.execute(f"""
-        SELECT date, message_count, session_count, tool_call_count, total_tokens
-        FROM daily_stats
-        WHERE date >= CURRENT_DATE - {iv}
-        ORDER BY date
-    """).fetchall()
-
-    conn.close()
-
-    return {
-        "period_days": days,
-        "overview": overview,
-        "model_usage": model_usage,
-        "subagent_model_usage": subagent_model_usage,
-        "top_projects": top_projects,
-        "daily_trend": daily,
-        "context": analyze_context(days),
-        "tools": analyze_tools(days),
-        "prompts": analyze_prompts(days),
-        "antipatterns": detect_antipatterns(days),
-        "scores": compute_scores(days),
-        "health": analyze_health(days),
-    }
-
-
-def recommend(days: int = 7) -> dict:
-    """Synthesize all analyzer findings into prioritized, actionable recommendations."""
-    recs = []
-    context = analyze_context(days)
-    tools = analyze_tools(days)
-    prompts_data = analyze_prompts(days)
-    antipatterns = detect_antipatterns(days)
-    health = analyze_health(days)
-    scores = compute_scores(days)
-    conn = get_connection(read_only=True)
-    iv = _interval(days)
-
-    # --- CONTEXT OPTIMIZATION ---
-    covered_files = set()
-    for row in health.get("claudemd_candidates", []):
-        fp, sessions, total_reads, rps = str(row[0]), row[1], row[2], row[3]
-        covered_files.add(fp)
-        recs.append({
-            "category": "context",
-            "priority": "high" if sessions >= 3 and rps > 3 else "medium",
-            "title": f"Add {_short_path(fp)} to CLAUDE.md",
-            "description": f"Read across {sessions} sessions ({total_reads} total, {rps} reads/session)",
-            "action": f"Summarize key content from {_short_path(fp)} in your project CLAUDE.md",
-            "estimated_impact": f"~{int(rps * 50)} tokens/session saved",
-            "source_data": {"file": fp, "sessions": sessions, "total_reads": total_reads},
-        })
-
-    for row in health.get("context_fragmenters", []):
-        fp, total_reads, repeat_reads, sessions = str(row[0]), row[1], row[2], row[3]
-        if fp in covered_files:
-            continue
-        recs.append({
-            "category": "context",
-            "priority": "high" if repeat_reads >= 5 else "medium",
-            "title": f"Reduce re-reads of {_short_path(fp)}",
-            "description": f"{total_reads} reads, {repeat_reads} repeats across {sessions} sessions",
-            "action": "Split into smaller modules or add summary to CLAUDE.md",
-            "estimated_impact": f"~{repeat_reads * 30} tokens saved",
-            "source_data": {"file": fp, "repeat_reads": repeat_reads},
-        })
-
-    # --- SESSION HYGIENE ---
-    long_sessions = conn.execute(f"""
-        SELECT session_id, project_name, user_message_count,
-               duration_seconds / 3600.0 as hours
-        FROM sessions
-        WHERE first_message_at >= CURRENT_DATE - {iv}
-          AND (user_message_count > 30 OR duration_seconds > 7200)
-        ORDER BY user_message_count DESC
-        LIMIT 10
-    """).fetchall()
-
-    high_sessions = [s for s in long_sessions if s[2] > 50 or (s[3] or 0) > 3]
-    med_sessions = [s for s in long_sessions if s not in high_sessions]
-
-    if high_sessions:
-        w = high_sessions[0]
-        recs.append({
-            "category": "session",
-            "priority": "high",
-            "title": f"Break {len(high_sessions)} long sessions (>50 turns or >3h)",
-            "description": f"Worst: {w[1]} with {w[2]} turns over {w[3]:.1f}h",
-            "action": "Use /clear between subtasks; aim for 20-30 turns per session",
-            "estimated_impact": "Better context coherence, fewer compactions",
-            "source_data": {"count": len(high_sessions)},
-        })
-    if med_sessions:
-        recs.append({
-            "category": "session",
-            "priority": "medium",
-            "title": f"Consider shorter sessions ({len(med_sessions)} sessions >30 turns)",
-            "description": f"Avg {sum(s[2] for s in med_sessions)/len(med_sessions):.0f} turns",
-            "action": "Start fresh sessions for new task domains",
-            "estimated_impact": "Better focus, less stale context",
-            "source_data": {"count": len(med_sessions)},
-        })
-
-    edit_retries = [ap for ap in antipatterns if ap["type"] == "edit_retry_cycle"]
-    if edit_retries:
-        recs.append({
-            "category": "session",
-            "priority": "medium",
-            "title": f"Read before editing ({len(edit_retries)} edit-retry cycles)",
-            "description": edit_retries[0]["description"][:80],
-            "action": "Read the target file first to get accurate old_string context",
-            "estimated_impact": f"~{len(edit_retries) * 2000} tokens saved",
-            "source_data": {"count": len(edit_retries)},
-        })
-
-    tool_retries = [ap for ap in antipatterns if ap["type"] == "tool_retry_no_change"]
-    if tool_retries:
-        recs.append({
-            "category": "session",
-            "priority": "medium",
-            "title": f"Change approach after failures ({len(tool_retries)} identical retries)",
-            "description": tool_retries[0]["description"][:80],
-            "action": "Adjust input or try a different tool instead of retrying",
-            "estimated_impact": f"~{len(tool_retries) * 500} tokens saved",
-            "source_data": {"count": len(tool_retries)},
-        })
-
-    # --- MODEL ROUTING ---
-    lookup_agents = {"Explore", "parallel-explorer", "batch-editor", "search-specialist",
-                     "quick-router", "claude-code-guide", "communications-specialist"}
-
-    for row in tools.get("subagent_stats", []):
-        agent_type = row[0] or "?"
-        model = row[1] or "?"
-        launches, avg_msgs, total_tokens = row[2], row[3] or 0, row[5] or 0
-        model_short = _short_model(model)
-
-        if "opus" in model.lower() and avg_msgs < 5 and launches >= 2:
-            recs.append({
-                "category": "model",
-                "priority": "high",
-                "title": f"Switch {agent_type} from Opus to Haiku",
-                "description": f"{launches} launches, avg {avg_msgs:.0f} msgs. Opus is overkill here.",
-                "action": f"Route {agent_type} to Haiku for ~60% cost reduction",
-                "estimated_impact": f"~60% savings on {total_tokens:,} tokens",
-                "source_data": {"agent_type": agent_type, "model": model_short, "launches": launches},
-            })
-        elif ("sonnet" in model.lower() or "opus" in model.lower()) and agent_type in lookup_agents and launches >= 2:
-            recs.append({
-                "category": "model",
-                "priority": "medium",
-                "title": f"Use Haiku for {agent_type} (currently {model_short})",
-                "description": f"Lookup agent with {launches} launches on {model_short}",
-                "action": f"Haiku handles {agent_type} well at lower cost",
-                "estimated_impact": f"Faster + cheaper ({total_tokens:,} tokens)",
-                "source_data": {"agent_type": agent_type, "model": model_short, "launches": launches},
-            })
-
-    # --- PROMPT IMPROVEMENT ---
-    patterns = prompts_data.get("patterns", [])
-    if patterns:
-        total_prompts = sum(p[1] for p in patterns)
-        other_count = sum(p[1] for p in patterns if p[0] == "other")
-        other_pct = other_count * 100 / total_prompts if total_prompts > 0 else 0
-
-        if other_pct > 70:
-            recs.append({
-                "category": "prompt",
-                "priority": "high",
-                "title": f"{other_pct:.0f}% of prompts lack clear intent",
-                "description": f"{other_count}/{total_prompts} prompts unclassified",
-                "action": "Use action verbs: Fix [thing] in [file], Add [feature], Refactor [module]",
-                "estimated_impact": "Fewer clarification turns",
-                "source_data": {"other_pct": other_pct, "total": total_prompts},
-            })
-        elif other_pct > 50:
-            recs.append({
-                "category": "prompt",
-                "priority": "medium",
-                "title": f"{other_pct:.0f}% of prompts could be more specific",
-                "description": f"{other_count} prompts lack clear action verbs",
-                "action": "Add file paths or component names for faster context",
-                "estimated_impact": "~1 fewer turn per vague prompt",
-                "source_data": {"other_pct": other_pct},
-            })
-
-    short_count = conn.execute(f"""
-        SELECT COUNT(*) FROM prompts
-        WHERE timestamp >= CURRENT_DATE - {iv}
-          AND word_count > 0 AND word_count < 8
-    """).fetchone()[0]
-    if short_count >= 5:
-        recs.append({
-            "category": "prompt",
-            "priority": "medium",
-            "title": f"{short_count} very short prompts (<8 words)",
-            "description": "Short prompts often need clarification, adding extra turns",
-            "action": "Add specificity: 'fix auth bug in src/login.py' vs 'fix the bug'",
-            "estimated_impact": f"~{short_count} fewer clarification turns",
-            "source_data": {"short_count": short_count},
-        })
-
-    paste_data = next((p for p in patterns if p[0] == "paste"), None)
-    if paste_data and paste_data[1] >= 5:
-        recs.append({
-            "category": "prompt",
-            "priority": "low",
-            "title": f"{paste_data[1]} paste prompts without action context",
-            "description": f"Pasted content avg {paste_data[2]:.0f} words, often needs follow-up",
-            "action": "Prefix pastes with intent: 'Fix this error: [paste]'",
-            "estimated_impact": "Clearer first-turn responses",
-            "source_data": {"paste_count": paste_data[1]},
-        })
-
-    conn.close()
-
-    # Sort by priority then category
-    priority_order = {"high": 0, "medium": 1, "low": 2}
-    recs.sort(key=lambda r: (priority_order.get(r["priority"], 3), r["category"]))
-
-    by_priority = {}
-    by_category = {}
-    for r in recs:
-        by_priority[r["priority"]] = by_priority.get(r["priority"], 0) + 1
-        by_category[r["category"]] = by_category.get(r["category"], 0) + 1
-
-    return {
-        "recommendations": recs,
-        "summary": {"total": len(recs), "by_priority": by_priority,
-                     "by_category": by_category, "scores": scores},
-    }
-
-
-def generate_markdown_recommendations(days: int = 7) -> str:
-    """Generate markdown-formatted recommendations."""
-    data = recommend(days)
-    recs = data["recommendations"]
-    summary = data["summary"]
-    scores = summary.get("scores", {})
-    lines = []
-
-    from datetime import date
-    from . import __version__
-    lines.append(f"# dt Recommendations - Last {days} Days\n")
-    lines.append(f"*Generated by dt v{__version__} on {date.today()}*\n")
-
-    if scores:
-        lines.append(f"**Scores:** Overall {scores.get('composite', 0)}/100 | "
-                      f"Context {scores.get('context', 0)} | Tools {scores.get('tools', 0)} | "
-                      f"Prompts {scores.get('prompts', 0)} | Health {scores.get('health', 0)}\n")
-
-    if not recs:
-        lines.append("No recommendations. Nice work!\n")
-        return "\n".join(lines)
-
-    bp = summary["by_priority"]
-    lines.append(f"**{summary['total']} recommendations:** "
-                  f"{bp.get('high', 0)} high, {bp.get('medium', 0)} medium, {bp.get('low', 0)} low\n")
-
-    categories = {"context": "Context Optimization", "session": "Session Hygiene",
-                   "model": "Model Routing", "prompt": "Prompt Improvement"}
-    for cat_key, cat_label in categories.items():
-        cat_recs = [r for r in recs if r["category"] == cat_key]
-        if not cat_recs:
-            continue
-        lines.append(f"## {cat_label}\n")
-        for r in cat_recs:
-            tag = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(r["priority"], "")
-            lines.append(f"### [{tag}] {r['title']}\n")
-            lines.append(f"{r['description']}\n")
-            lines.append(f"**Action:** {r['action']}\n")
-            lines.append(f"**Impact:** {r['estimated_impact']}\n")
-
-    return "\n".join(lines)
