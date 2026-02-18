@@ -267,6 +267,81 @@ def detect_antipatterns(days: int = 7) -> list[dict]:
             "suggestion": f"Review common {row[0]} failures; may indicate prompt issues",
         })
 
+    # Edit-retry cycles: same file edited multiple times with errors between
+    edit_retries = conn.execute(f"""
+        SELECT
+            session_id, file_path,
+            SUM(CASE WHEN result_error THEN 1 ELSE 0 END) as edit_errors,
+            COUNT(*) as edit_attempts
+        FROM tool_calls
+        WHERE timestamp >= CURRENT_DATE - {iv}
+          AND tool_name IN ('Edit', 'edit')
+          AND file_path IS NOT NULL
+        GROUP BY session_id, file_path
+        HAVING edit_errors >= 2
+        ORDER BY edit_errors DESC
+        LIMIT 10
+    """).fetchall()
+
+    for row in edit_retries:
+        findings.append({
+            "type": "edit_retry_cycle",
+            "severity": "warning",
+            "session_id": row[0],
+            "description": f"Edit failed {row[2]}x on {row[1]} ({row[3]} total attempts)",
+            "file_path": row[1],
+            "suggestion": "Read the file first to get accurate old_string context",
+        })
+
+    # Stale sessions: running 2+ hours
+    stale_sessions = conn.execute(f"""
+        SELECT session_id, project_name, duration_seconds / 3600.0 as hours,
+               user_message_count
+        FROM sessions
+        WHERE first_message_at >= CURRENT_DATE - {iv}
+          AND duration_seconds > 7200
+        ORDER BY duration_seconds DESC
+        LIMIT 10
+    """).fetchall()
+
+    for row in stale_sessions:
+        findings.append({
+            "type": "stale_session",
+            "severity": "info",
+            "session_id": row[0],
+            "description": f"Session in {row[1]} ran {row[2]:.1f}h with {row[3]} turns",
+            "suggestion": "Use /clear between subtasks to avoid context drift",
+        })
+
+    # Tool retry without change: same tool+input called consecutively
+    consecutive_dupes = conn.execute(f"""
+        WITH ordered AS (
+            SELECT session_id, tool_name, input_summary, timestamp,
+                   LAG(tool_name) OVER (PARTITION BY session_id ORDER BY timestamp) as prev_tool,
+                   LAG(input_summary) OVER (PARTITION BY session_id ORDER BY timestamp) as prev_summary
+            FROM tool_calls
+            WHERE timestamp >= CURRENT_DATE - {iv}
+        )
+        SELECT session_id, tool_name, COUNT(*) as repeats
+        FROM ordered
+        WHERE tool_name = prev_tool
+          AND input_summary = prev_summary
+          AND tool_name NOT IN ('Read', 'read')
+        GROUP BY session_id, tool_name
+        HAVING repeats >= 2
+        ORDER BY repeats DESC
+        LIMIT 10
+    """).fetchall()
+
+    for row in consecutive_dupes:
+        findings.append({
+            "type": "tool_retry_no_change",
+            "severity": "warning",
+            "session_id": row[0],
+            "description": f"{row[1]} called {row[2]}x with identical input in one session",
+            "suggestion": "Change approach if a tool call fails repeatedly",
+        })
+
     opus_waste = conn.execute(f"""
         SELECT
             agent_type, model, COUNT(*) as launches,
@@ -289,6 +364,179 @@ def detect_antipatterns(days: int = 7) -> list[dict]:
 
     conn.close()
     return findings
+
+
+def analyze_health(days: int = 30) -> dict:
+    """Analyze project configuration health."""
+    conn = get_connection(read_only=True)
+    iv = _interval(days)
+
+    # Projects with high file access but potentially missing CLAUDE.md
+    high_access_projects = conn.execute(f"""
+        SELECT
+            s.project_name,
+            COUNT(DISTINCT fa.session_id) as sessions,
+            COUNT(*) as total_reads,
+            COUNT(DISTINCT fa.file_path) as unique_files
+        FROM file_access fa
+        JOIN sessions s ON fa.session_id = s.session_id
+        WHERE fa.timestamp >= CURRENT_DATE - {iv}
+          AND fa.access_type = 'read'
+        GROUP BY s.project_name
+        HAVING total_reads >= 10
+        ORDER BY total_reads DESC
+        LIMIT 15
+    """).fetchall()
+
+    # Files read many times across sessions (CLAUDE.md candidates)
+    claudemd_candidates = conn.execute(f"""
+        SELECT
+            file_path,
+            COUNT(DISTINCT session_id) as sessions,
+            COUNT(*) as total_reads,
+            ROUND(COUNT(*) * 1.0 / COUNT(DISTINCT session_id), 1) as reads_per_session
+        FROM file_access
+        WHERE timestamp >= CURRENT_DATE - {iv}
+          AND access_type = 'read'
+          AND file_path NOT LIKE '%%CLAUDE.md'
+          AND file_path NOT LIKE '%%.claude/%%'
+        GROUP BY file_path
+        HAVING sessions >= 3 AND reads_per_session > 3
+        ORDER BY reads_per_session DESC
+        LIMIT 15
+    """).fetchall()
+
+    # Large files that may fragment context (read many times, high repeat count)
+    context_fragmenters = conn.execute(f"""
+        SELECT
+            file_path,
+            COUNT(*) as total_reads,
+            SUM(CASE WHEN is_repeat THEN 1 ELSE 0 END) as repeat_reads,
+            COUNT(DISTINCT session_id) as sessions
+        FROM file_access
+        WHERE timestamp >= CURRENT_DATE - {iv}
+          AND access_type = 'read'
+        GROUP BY file_path
+        HAVING repeat_reads >= 3
+        ORDER BY repeat_reads DESC
+        LIMIT 15
+    """).fetchall()
+
+    # Sessions with high tool error rates (may indicate config issues)
+    error_prone_projects = conn.execute(f"""
+        SELECT
+            project_name,
+            COUNT(*) as sessions,
+            SUM(tool_call_count) as total_tools,
+            SUM(tool_error_count) as total_errors,
+            ROUND(SUM(tool_error_count) * 100.0 / NULLIF(SUM(tool_call_count), 0), 1) as error_rate
+        FROM sessions
+        WHERE first_message_at >= CURRENT_DATE - {iv}
+          AND tool_call_count > 0
+        GROUP BY project_name
+        HAVING total_errors > 5
+        ORDER BY error_rate DESC
+        LIMIT 10
+    """).fetchall()
+
+    conn.close()
+    return {
+        "high_access_projects": high_access_projects,
+        "claudemd_candidates": claudemd_candidates,
+        "context_fragmenters": context_fragmenters,
+        "error_prone_projects": error_prone_projects,
+    }
+
+
+def compute_scores(days: int = 7) -> dict:
+    """Compute 0-100 scores for each analyzer dimension."""
+    conn = get_connection(read_only=True)
+    iv = _interval(days)
+
+    # Context score: based on cache efficiency and repeat read ratio
+    cache_row = conn.execute(f"""
+        SELECT
+            COALESCE(SUM(cache_read_tokens), 0) as cache_reads,
+            COALESCE(SUM(input_tokens), 0) as direct_input
+        FROM messages
+        WHERE timestamp >= CURRENT_DATE - {iv}
+    """).fetchone()
+    cache_total = (cache_row[0] or 0) + (cache_row[1] or 0)
+    cache_pct = (cache_row[0] / cache_total * 100) if cache_total > 0 else 100
+
+    repeat_row = conn.execute(f"""
+        SELECT
+            COUNT(*) as total_reads,
+            SUM(CASE WHEN is_repeat THEN 1 ELSE 0 END) as repeats
+        FROM file_access
+        WHERE timestamp >= CURRENT_DATE - {iv}
+          AND access_type = 'read'
+    """).fetchone()
+    total_reads = repeat_row[0] or 1
+    repeat_pct = (repeat_row[1] or 0) / total_reads * 100
+
+    # Context score: cache efficiency (60% weight) + low repeat rate (40% weight)
+    context_score = min(100, int(cache_pct * 0.6 + max(0, 100 - repeat_pct * 5) * 0.4))
+
+    # Tool score: based on error rate
+    tool_row = conn.execute(f"""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN result_error THEN 1 ELSE 0 END) as errors
+        FROM tool_calls
+        WHERE timestamp >= CURRENT_DATE - {iv}
+    """).fetchone()
+    total_tools = tool_row[0] or 1
+    tool_error_pct = (tool_row[1] or 0) / total_tools * 100
+    tool_score = max(0, min(100, int(100 - tool_error_pct * 3)))
+
+    # Prompt score: based on "other" classification rate and avg word count
+    prompt_row = conn.execute(f"""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN pattern = 'other' THEN 1 ELSE 0 END) as other_count,
+            AVG(word_count) as avg_words
+        FROM prompts
+        WHERE timestamp >= CURRENT_DATE - {iv}
+    """).fetchone()
+    total_prompts = prompt_row[0] or 1
+    other_pct = (prompt_row[1] or 0) / total_prompts * 100
+    avg_words = prompt_row[2] or 0
+    # Penalize high "other" rate and very short prompts
+    prompt_score = max(0, min(100, int(100 - other_pct * 0.5 - max(0, 10 - avg_words) * 3)))
+
+    # Health score: based on anti-pattern count
+    ap_row = conn.execute(f"""
+        SELECT COUNT(*) FROM (
+            SELECT session_id, file_path
+            FROM file_access
+            WHERE timestamp >= CURRENT_DATE - {iv}
+              AND access_type = 'read'
+            GROUP BY session_id, file_path
+            HAVING COUNT(*) >= 5
+        )
+    """).fetchone()
+    severe_repeats = ap_row[0] or 0
+    # Scale: 0 repeats = 100, 10 = 80, 20 = 60, 50+ = ~30
+    health_score = max(20, min(100, int(100 - severe_repeats * 1.5)))
+
+    conn.close()
+
+    # Composite: weighted average
+    composite = int(
+        context_score * 0.30 +
+        tool_score * 0.25 +
+        prompt_score * 0.20 +
+        health_score * 0.25
+    )
+
+    return {
+        "context": context_score,
+        "tools": tool_score,
+        "prompts": prompt_score,
+        "health": health_score,
+        "composite": composite,
+    }
 
 
 def generate_report(days: int = 7) -> dict:
@@ -373,4 +621,6 @@ def generate_report(days: int = 7) -> dict:
         "tools": analyze_tools(days),
         "prompts": analyze_prompts(days),
         "antipatterns": detect_antipatterns(days),
+        "scores": compute_scores(days),
+        "health": analyze_health(days),
     }

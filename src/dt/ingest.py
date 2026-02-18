@@ -588,26 +588,56 @@ def ingest_prompts(conn):
 def classify_prompt(text: str) -> str:
     """Classify prompt into a pattern category."""
     t = text.lower().strip()
-    if t in ("continue", "yes", "y", "ok", "go ahead", "proceed"):
+    if not t:
+        return "other"
+    if t in ("continue", "yes", "y", "ok", "go ahead", "proceed", "go", "do it",
+             "sure", "yep", "yeah", "k", "keep going", "next"):
         return "continue"
     if t.startswith("/"):
         return "command"
-    if any(t.startswith(w) for w in ("fix ", "debug ", "why is", "why does", "what's wrong")):
-        return "fix"
-    if any(t.startswith(w) for w in ("create ", "build ", "make ", "add ", "implement ", "write ")):
-        return "create"
-    if any(t.startswith(w) for w in ("refactor", "clean up", "simplify", "optimize")):
-        return "refactor"
-    if any(t.startswith(w) for w in ("what ", "how ", "why ", "where ", "explain", "show me")):
-        return "question"
-    if any(t.startswith(w) for w in ("update ", "change ", "modify ", "edit ")):
-        return "update"
-    if any(t.startswith(w) for w in ("test ", "run ", "check ")):
-        return "execute"
-    if any(t.startswith(w) for w in ("read ", "look at", "review ")):
-        return "review"
-    if "[pasted" in t.lower():
+    if "[pasted" in t:
         return "paste"
+    if any(t.startswith(w) for w in ("fix ", "debug ", "why is", "why does", "what's wrong",
+                                      "error ", "broken ", "failing ", "crash")):
+        return "fix"
+    if any(t.startswith(w) for w in ("create ", "build ", "make ", "add ", "implement ",
+                                      "write ", "generate ", "scaffold ", "new ")):
+        return "create"
+    if any(t.startswith(w) for w in ("refactor", "clean up", "simplify", "optimize",
+                                      "reorganize", "restructure")):
+        return "refactor"
+    if any(t.startswith(w) for w in ("what ", "how ", "why ", "where ", "which ", "when ",
+                                      "explain", "show me", "tell me", "describe",
+                                      "can you", "could you", "is there", "are there",
+                                      "do we", "does ")):
+        return "question"
+    if any(t.startswith(w) for w in ("update ", "change ", "modify ", "edit ", "rename ",
+                                      "replace ", "swap ", "switch ")):
+        return "update"
+    if any(t.startswith(w) for w in ("test ", "run ", "check ", "execute ", "start ",
+                                      "launch ", "deploy ", "push ", "publish ")):
+        return "execute"
+    if any(t.startswith(w) for w in ("read ", "look at", "review ", "examine ",
+                                      "inspect ", "audit ", "check out")):
+        return "review"
+    if any(t.startswith(w) for w in ("find ", "search ", "grep ", "locate ", "look for",
+                                      "where is", "which file")):
+        return "search"
+    if any(t.startswith(w) for w in ("install ", "setup ", "configure ", "set up",
+                                      "init ", "initialize ", "config ")):
+        return "configure"
+    if any(t.startswith(w) for w in ("move ", "copy ", "delete ", "remove ", "trash ",
+                                      "mv ", "cp ", "rm ")):
+        return "fileops"
+    if any(t.startswith(w) for w in ("document ", "docs ", "readme ", "comment ",
+                                      "annotate ", "describe ")):
+        return "document"
+    if any(t.startswith(w) for w in ("analyze ", "compare ", "diff ", "measure ",
+                                      "count ", "list ", "summarize ", "report ")):
+        return "analyze"
+    if any(t.startswith(w) for w in ("commit ", "push ", "pull ", "merge ", "branch ",
+                                      "git ", "pr ", "rebase ")):
+        return "git"
     return "other"
 
 

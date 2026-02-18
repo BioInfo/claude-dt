@@ -10,7 +10,7 @@ console = Console()
 
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version="0.2.0")
 def cli():
     """dt - Claude Code DevTools. Actionable intelligence from session data."""
     pass
@@ -94,6 +94,22 @@ def report(period, project, fmt):
             return str(obj)
         console.print(json.dumps(data, default=serialize, indent=2))
         return
+
+    # Scores panel
+    scores = data.get("scores", {})
+    if scores:
+        score_text = Text()
+        composite = scores.get("composite", 0)
+        comp_style = "green bold" if composite >= 80 else ("yellow bold" if composite >= 60 else "red bold")
+        score_text.append(f"  Overall: ", style="bold")
+        score_text.append(f"{composite}/100\n", style=comp_style)
+        for key, label in [("context", "Context"), ("tools", "Tools"), ("prompts", "Prompts"), ("health", "Health")]:
+            s = scores.get(key, 0)
+            style = "green" if s >= 80 else ("yellow" if s >= 60 else "red")
+            score_text.append(f"  {label}: ")
+            score_text.append(f"{s}/100", style=style)
+            score_text.append("  ")
+        console.print(Panel(score_text, title="Scores", border_style="magenta"))
 
     # Overview panel
     ov = data["overview"]
@@ -433,6 +449,117 @@ def query(sql):
         console.print(t)
     except Exception as e:
         console.print(f"[red]Query error: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@cli.command()
+@click.option("--days", type=int, default=30, help="Number of days to analyze")
+def health(days):
+    """Project configuration health check."""
+    from .analyzers import analyze_health, compute_scores
+
+    data = analyze_health(days)
+    scores = compute_scores(days)
+
+    # Overall health score
+    h = scores.get("health", 0)
+    style = "green" if h >= 80 else ("yellow" if h >= 60 else "red")
+    console.print(Panel(f"[{style} bold]Health Score: {h}/100[/{style} bold]", border_style=style))
+
+    # CLAUDE.md candidates
+    if data["claudemd_candidates"]:
+        t = Table(title="CLAUDE.md Candidates (frequently re-read files)", border_style="yellow")
+        t.add_column("File")
+        t.add_column("Sessions", justify="right")
+        t.add_column("Total Reads", justify="right")
+        t.add_column("Reads/Session", justify="right")
+        for row in data["claudemd_candidates"]:
+            t.add_row(str(row[0])[-60:], f"{row[1]}", f"{row[2]}", f"{row[3]}")
+        console.print(t)
+
+    # Context fragmenters
+    if data["context_fragmenters"]:
+        t = Table(title="Context Fragmenters (high repeat reads)", border_style="red")
+        t.add_column("File")
+        t.add_column("Total Reads", justify="right")
+        t.add_column("Repeat Reads", justify="right")
+        t.add_column("Sessions", justify="right")
+        for row in data["context_fragmenters"]:
+            t.add_row(str(row[0])[-60:], f"{row[1]}", f"{row[2]}", f"{row[3]}")
+        console.print(t)
+
+    # Error-prone projects
+    if data["error_prone_projects"]:
+        t = Table(title="Error-Prone Projects", border_style="red")
+        t.add_column("Project")
+        t.add_column("Sessions", justify="right")
+        t.add_column("Tool Calls", justify="right")
+        t.add_column("Errors", justify="right")
+        t.add_column("Error %", justify="right")
+        for row in data["error_prone_projects"]:
+            t.add_row(row[0], f"{row[1]}", f"{row[2]:,}", f"{row[3]:,}", f"{row[4]}%")
+        console.print(t)
+
+    # High access projects
+    if data["high_access_projects"]:
+        t = Table(title="Most-Accessed Projects", border_style="dim")
+        t.add_column("Project")
+        t.add_column("Sessions", justify="right")
+        t.add_column("File Reads", justify="right")
+        t.add_column("Unique Files", justify="right")
+        for row in data["high_access_projects"]:
+            t.add_row(row[0], f"{row[1]}", f"{row[2]:,}", f"{row[3]}")
+        console.print(t)
+
+
+@cli.command("export")
+@click.argument("table_name", type=click.Choice(
+    ["sessions", "messages", "tool_calls", "subagents", "file_access", "prompts", "daily_stats"]
+))
+@click.option("--format", "fmt", type=click.Choice(["csv", "json", "parquet"]), default="csv")
+@click.option("--output", "-o", "output_path", type=str, help="Output file path")
+@click.option("--days", type=int, help="Limit to last N days")
+def export_cmd(table_name, fmt, output_path, days):
+    """Export a table as CSV, JSON, or Parquet."""
+    from .db import get_connection
+
+    conn = get_connection(read_only=True)
+
+    # Build query with optional date filter
+    date_col = {
+        "sessions": "first_message_at",
+        "messages": "timestamp",
+        "tool_calls": "timestamp",
+        "subagents": "started_at",
+        "file_access": "timestamp",
+        "prompts": "timestamp",
+        "daily_stats": "date",
+    }.get(table_name, "timestamp")
+
+    where = ""
+    if days:
+        iv = f"INTERVAL '{days}' DAY"
+        where = f"WHERE {date_col} >= CURRENT_DATE - {iv}"
+
+    query = f"SELECT * FROM {table_name} {where}"
+
+    if not output_path:
+        output_path = f"dt-{table_name}.{fmt}"
+
+    try:
+        if fmt == "csv":
+            conn.execute(f"COPY ({query}) TO '{output_path}' (FORMAT CSV, HEADER)")
+        elif fmt == "json":
+            conn.execute(f"COPY ({query}) TO '{output_path}' (FORMAT JSON)")
+        elif fmt == "parquet":
+            conn.execute(f"COPY ({query}) TO '{output_path}' (FORMAT PARQUET)")
+
+        import os
+        size = os.path.getsize(output_path)
+        console.print(f"[green]Exported {table_name} to {output_path} ({size:,} bytes)[/green]")
+    except Exception as e:
+        console.print(f"[red]Export error: {e}[/red]")
     finally:
         conn.close()
 
