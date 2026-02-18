@@ -10,7 +10,7 @@ console = Console()
 
 
 @click.group()
-@click.version_option(version="0.2.0")
+@click.version_option(version="0.3.0")
 def cli():
     """dt - Claude Code DevTools. Actionable intelligence from session data."""
     pass
