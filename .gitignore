@@ -12,3 +12,16 @@ build/
 dt-*.csv
 dt-*.json
 dt-*.parquet
+
+# Frontend
+web/node_modules/
+src/dt/static/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db

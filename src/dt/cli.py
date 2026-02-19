@@ -711,6 +711,27 @@ def health(days, fix, project):
         console.print(t)
 
 
+@cli.command()
+@click.option("--port", type=int, default=8042, help="Port to serve on")
+@click.option("--dev", is_flag=True, help="API-only mode (no static files, for use with Vite dev server)")
+def serve(port, dev):
+    """Start the web dashboard server."""
+    import uvicorn
+
+    if dev:
+        console.print(f"[blue]Starting dt API server on http://localhost:{port} (dev mode)[/blue]")
+        console.print(f"[dim]Run 'cd web && npm run dev' for the frontend[/dim]")
+    else:
+        from .api import STATIC_DIR
+        if not STATIC_DIR.exists():
+            console.print("[yellow]No built frontend found. Run 'cd web && npm run build' first,[/yellow]")
+            console.print("[yellow]or use --dev flag for API-only mode with Vite dev server.[/yellow]")
+            return
+        console.print(f"[green]Starting dt dashboard on http://localhost:{port}[/green]")
+
+    uvicorn.run("dt.api:app", host="127.0.0.1", port=port, log_level="info")
+
+
 @cli.command("export")
 @click.argument("table_name", type=click.Choice(
     ["sessions", "messages", "tool_calls", "subagents", "file_access", "prompts", "daily_stats"]

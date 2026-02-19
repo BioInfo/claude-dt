@@ -39,6 +39,8 @@ That's it. Everything runs offline on your machine.
 - **Trend Analysis** - Track metrics over time with period-over-period comparison and sparkline charts
 - **Multiple Output Formats** - Rich terminal output (colored tables, panels), Markdown for docs, JSON for automation
 - **Export Tools** - Export any table as CSV, JSON, or Parquet for external analysis
+- **Smart Recommendations** - Prioritized, actionable suggestions with ready-to-paste prompts
+- **Web Dashboard** - Interactive browser UI with scores, charts, filtering, and drill-down
 - **Raw SQL Access** - Power users can query the DuckDB directly with `dt query`
 - **Read-Only Analysis** - Never modifies Claude Code files or configuration
 - **Zero Configuration** - Works out of the box with sensible defaults
@@ -74,8 +76,8 @@ dt report
 ### Development Installation
 
 ```bash
-git clone https://github.com/yourusername/dt.git
-cd dt
+git clone https://github.com/BioInfo/claude-dt.git
+cd claude-dt
 python3 -m venv .venv
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
@@ -222,6 +224,46 @@ Shows:
 - High-access projects
 
 Use `--fix` to generate suggestions for improving your CLAUDE.md based on actual file access patterns.
+
+#### dt recommend
+
+Generate prioritized recommendations with ready-to-paste prompts.
+
+```bash
+dt recommend                         # Last 7 days, all categories
+dt recommend --days 14               # Last 14 days
+dt recommend --category context      # Only context-related recs
+dt recommend --format json           # JSON output
+dt recommend --format markdown       # Markdown output
+```
+
+Categories: `all`, `context`, `session`, `model`, `prompt`, `tools`
+
+Each recommendation includes:
+- Priority level (high, medium, low)
+- Description of the issue
+- Concrete action to take
+- A prompt you can paste directly into Claude Code
+
+#### dt serve
+
+Start an interactive web dashboard in your browser.
+
+```bash
+dt serve                             # Start on http://localhost:8042
+dt serve --port 9000                 # Custom port
+dt serve --dev                       # API-only mode (for frontend development)
+```
+
+The dashboard provides:
+- Score gauges for all four dimensions
+- Interactive charts with zoom and filtering
+- Sortable, paginated tables
+- Recommendation cards with copy-to-clipboard prompts
+- Session browser with detail drill-down
+- Trend comparison with period switching
+
+**Frontend development:** Run `dt serve --dev` for the API, then `cd web && npm run dev` for hot-reloading on port 5173.
 
 #### dt session
 
@@ -460,7 +502,7 @@ dt is open-source. Contributions welcome:
 - Suggest improvements to scoring algorithms
 - Help with documentation and examples
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) (coming soon).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup and guidelines.
 
 ## Performance Notes
 
@@ -500,18 +542,26 @@ dt stores data efficiently:
 - Markdown and JSON output formats
 - `dt session`, `dt trends`, `dt health` commands
 
-### Phase 4: Community & Distribution (v0.4)
-- PyPI package and comprehensive documentation
-- CI/CD and cross-platform testing
-- Sample reports and contributing guide
+### Phase 4: Tests & Documentation (v0.3) - COMPLETE
+- 194 tests with full coverage
+- Comprehensive README and contributing guide
 
-### Phase 5: Extensions (v0.5+)
+### Phase 5: Recommendations (v0.3) - COMPLETE
+- `dt recommend` with prioritized, actionable suggestions
+- Ready-to-paste prompts for each recommendation
+- Category filtering (context, session, model, prompt, tools)
+
+### Phase 6: Web Dashboard (v0.4) - COMPLETE
+- `dt serve` with FastAPI backend and React frontend
+- Interactive charts (Recharts), sortable tables, pagination
+- Score gauges, trend comparison, session browser
+- Recommendation cards with copy-to-clipboard
+
+### Phase 7: Community & Extensions (v0.5+)
+- PyPI package distribution
+- CI/CD and cross-platform testing
 - Hook integration for live insights during sessions
-- Skill effectiveness scoring
-- Auto-generation of CLAUDE.md from usage patterns
-- Subagent model routing recommendations
 - Custom analyzer plugin system
-- Obsidian integration
 
 ## Related Tools
 
